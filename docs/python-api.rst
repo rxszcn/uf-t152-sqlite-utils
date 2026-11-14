@@ -2031,11 +2031,11 @@ To achieve this, the SQL produced by ``transform_sql()`` turns on ``PRAGMA legac
 Custom transformations with .transform_sql()
 --------------------------------------------
 
-The ``.transform()`` method can handle most cases, but it does not automatically upgrade indexes, views or triggers associated with the table that is being transformed.
+The ``.transform()`` method can handle most cases, but it does not automatically upgrade views associated with the table that is being transformed.
 
-If you want to do something more advanced, you can call the ``table.transform_sql(...)`` method with the same arguments that you would have passed to ``table.transform(...)``.
+Triggers are preserved across the rebuild. The full-text search triggers created by :meth:`table.enable_fts() <Table.enable_fts>` and the cached count triggers created by :meth:`table.enable_counts() <Table.enable_counts>` are recreated from their original definitions, rebound to any renamed columns, and the full-text index and cached count are re-synced so they cannot drift from the rebuilt table. Any other triggers are recreated with their ``new.``/``old.`` column references rewritten to follow renamed columns; references to other tables are left untouched. Dropping a column that is indexed by a full-text search table raises ``TransformError`` - drop or recreate the search index first.
 
-This method will return a list of SQL statements that should be executed to implement the change. You can then make modifications to that SQL - or add additional SQL statements - before executing it yourself.
+If you want to do something more advanced, you can call the ``table.transform_sql(...)`` method with the same arguments that you would have passed to ``table.transform(...)``. That method returns only the table-rebuild SQL; the trigger recreation described above is performed by ``.transform()`` itself, so a hand-run ``.transform_sql()`` script still needs to handle triggers the way previous releases required.
 
 .. _python_api_transform_foreign_keys_transactions:
 

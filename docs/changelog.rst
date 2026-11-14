@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_2_2:
+
+4.2.2 (unreleased)
+------------------
+
+- ``table.transform()`` now preserves triggers across the table rebuild. The full-text search triggers created by ``table.enable_fts(..., create_triggers=True)`` and the cached count triggers created by ``table.enable_counts()`` are recreated with identical semantics, rebound to any renamed columns, and the full-text index and cached count are re-synced so they stay consistent with the rebuilt table. Other triggers are recreated with their ``new.``/``old.`` column references rewritten to follow renamed columns while references to other tables are left untouched. Previously the rebuild silently dropped every trigger, leaving full-text search and cached counts permanently stale. Dropping a column indexed by a full-text search table now raises ``TransformError`` instead of silently breaking the index.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

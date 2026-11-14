@@ -36,8 +36,10 @@ from .create_table_parser import (
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_fts_columns,
     parse_uniques,
     rewrite_check_expression,
+    rewrite_trigger_columns,
     sql_ends_in_line_comment,
 )
 from .utils import (
@@ -2640,6 +2642,233 @@ class Table(Queryable):
             self.db.execute(sql)
         return self.db.table(new_name)
 
+    # Names of the triggers sqlite-utils creates for full-text search and the
+    # cached counts table.
+    def _fts_trigger_names(self) -> set[str]:
+        return {self.name + suffix for suffix in ("_ai", "_ad", "_au")}
+
+    def _counts_trigger_name_set(self) -> set[str]:
+        return set(self._counts_trigger_names())
+
+    def _trigger_rebuild_snapshot(
+        self, rename: dict[str, str], drop: set[str]
+    ) -> dict[str, Any]:
+        """Capture everything needed to recreate this table's triggers after
+        the table itself has been rebuilt."""
+        triggers = self.triggers
+        trigger_names = {trigger.name for trigger in triggers}
+        fts_trigger_names = self._fts_trigger_names()
+        counts_trigger_names = self._counts_trigger_name_set()
+
+        # Only treat the triggers as managed when the full set is present - a
+        # custom trigger that happens to share one of these names must not be
+        # mistaken for a sqlite-utils managed trigger.
+        has_fts_triggers = fts_trigger_names.issubset(trigger_names)
+        has_counts_triggers = counts_trigger_names.issubset(trigger_names)
+        # An FTS virtual table can exist without the sync triggers - in that
+        # case there is nothing to rebuild, but the configuration is still
+        # needed to update the trigger columns when columns are renamed.
+        fts_configuration = (
+            self.fts_configuration() if has_fts_triggers else None
+        )
+        if has_fts_triggers and fts_configuration is None:
+            # The managed triggers exist but the FTS schema could not be
+            # parsed - fall back to treating them as ordinary custom triggers
+            # rather than failing the whole transform.
+            has_fts_triggers = False
+        if fts_configuration is not None:
+            fts_columns = fts_configuration["columns"]
+            dropped_fts_columns = [column for column in fts_columns if column in drop]
+            if dropped_fts_columns:
+                raise TransformError(
+                    "Cannot drop column{} {}: {} used by the full-text search "
+                    "index {}. Drop the search index with disable_fts() first, "
+                    "or recreate it against the remaining columns using "
+                    "enable_fts(..., replace=True).".format(
+                        "s" if len(dropped_fts_columns) > 1 else "",
+                        ", ".join(
+                            quote_identifier(column)
+                            for column in dropped_fts_columns
+                        ),
+                        "they are" if len(dropped_fts_columns) > 1 else "it is",
+                        quote_identifier(fts_configuration["fts_table"]),
+                    )
+                )
+            # Columns the FTS triggers read from, rebound to the renamed names
+            fts_configuration["content_columns"] = [
+                rename.get(column) or column for column in fts_columns
+            ]
+
+        # A name is only claimed as managed when its whole trigger set exists.
+        # A custom trigger sharing one managed name (but not the full set) is
+        # preserved as a custom trigger instead of being dropped.
+        claimed_managed_names = (
+            fts_trigger_names if has_fts_triggers else set()
+        ) | (counts_trigger_names if has_counts_triggers else set())
+
+        # Triggers that sqlite-utils did not create are preserved by rewriting
+        # the identifiers embedded in their stored CREATE TRIGGER SQL.
+        custom_triggers = [
+            (trigger.name, trigger.sql)
+            for trigger in triggers
+            if trigger.name not in claimed_managed_names
+        ]
+        return {
+            "has_fts_triggers": has_fts_triggers,
+            "has_counts_triggers": has_counts_triggers,
+            "fts": fts_configuration,
+            "custom_triggers": custom_triggers,
+        }
+
+    def _rebuild_triggers(
+        self,
+        snapshot: dict[str, Any],
+        keep_table: str | None,
+        rename: dict[str, str],
+    ) -> None:
+        """Recreate the snapshotted triggers against the rebuilt table.
+
+        Managed full-text search and count triggers are regenerated from the
+        same templates as :meth:`enable_fts` and :meth:`enable_counts`, so
+        their semantics are byte-for-byte identical apart from the table and
+        column names they reference. Other triggers are recreated from their
+        original SQL with embedded identifiers rebound to the renamed names.
+
+        Naming conflicts only arise with ``keep_table=``: SQLite reattaches the
+        original triggers to the renamed backup table under their original
+        names, so recreating triggers of the same name on the replacement
+        table would collide. The replacement table's triggers therefore get a
+        random ``_<hex>`` suffix - deterministic numbering could not work
+        because transform() does not know which names earlier transforms (or
+        the user's own triggers) have already taken, while a fresh random
+        suffix is collision-free and stable for the lifetime of the table. Any
+        residual collision is defused by appending an incrementing counter.
+        """
+        # When keep_table= leaves the old table in place, SQLite reattaches the
+        # original triggers to it under their original names, so the
+        # replacement table's triggers need distinct names.
+        name_suffix = f"_{os.urandom(6).hex()}" if keep_table else ""
+        existing_trigger_names = {
+            row[0]
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+
+        def _resolve_name(requested: str) -> str:
+            # Defensive guard for collisions with triggers attached to the kept
+            # table or any other trigger already in the schema.
+            candidate = requested
+            counter = 1
+            while candidate in existing_trigger_names:
+                candidate = f"{requested}_{counter}"
+                counter += 1
+            existing_trigger_names.add(candidate)
+            return candidate
+
+        statements: list[str] = []
+        if snapshot["has_fts_triggers"]:
+            fts = snapshot["fts"]
+            # The rebuilt content table is a fresh object as far as the
+            # external-content FTS table is concerned, so its index is now
+            # stale. Re-sync the index before recreating the triggers, so the
+            # repopulation cannot itself fire the new _ai trigger. Emptying
+            # and refilling works for both FTS4 and FTS5, and keeps the FTS
+            # table's own column names unchanged when content columns were
+            # renamed.
+            self._repopulate_fts_after_rebuild(fts)
+            statements.append(
+                self.fts_triggers_sql(
+                    fts["columns"],
+                    trigger_name_suffix=name_suffix,
+                    content_columns=fts["content_columns"],
+                )
+            )
+        if snapshot["has_counts_triggers"]:
+            statements.append(
+                self.counts_triggers_sql(trigger_name_suffix=name_suffix)
+            )
+            # The rebuild copied every row directly, bypassing the triggers -
+            # re-prime the cached count so it cannot drift from the real table.
+            self.db.execute(
+                f"INSERT OR REPLACE INTO {quote_identifier(self.db._counts_table_name)} VALUES ({self.db.quote(self.name)}, (SELECT COUNT(*) FROM {quote_identifier(self.name)}));"
+            )
+        for original_name, original_sql in snapshot["custom_triggers"]:
+            requested_name = _resolve_name(original_name + name_suffix)
+            statements.append(
+                self._rebuild_custom_trigger_sql(
+                    original_sql,
+                    rename=rename,
+                    new_trigger_name=requested_name,
+                )
+            )
+        if statements:
+            self.db._executescript("\n".join(statements))
+
+    def _rebuild_custom_trigger_sql(
+        self,
+        original_sql: str,
+        rename: dict[str, str],
+        new_trigger_name: str,
+    ) -> str:
+        # Rebind new./old. column references and UPDATE OF lists to the
+        # renamed columns. References to other tables, string literals and
+        # function names are left untouched. The table name is unchanged by
+        # transform(), so it does not need rewriting either.
+        rewritten = rewrite_trigger_columns(original_sql, dict(rename))
+        return self._rename_trigger_statement(rewritten, new_trigger_name)
+
+    def _repopulate_fts_after_rebuild(self, fts: dict[str, Any]) -> None:
+        fts_table = quote_identifier(fts["fts_table"])
+        fts_columns = [quote_identifier(column) for column in fts["columns"]]
+        content_columns = [
+            quote_identifier(column) for column in fts["content_columns"]
+        ]
+        if fts["fts_version"] == "FTS5":
+            # FTS5's 'rebuild' reads the content table through the FTS table's
+            # stored column names, which break when a content column is
+            # renamed. 'delete-all' empties the index unconditionally so the
+            # populate below is the single source of truth.
+            self.db.execute(
+                f"INSERT INTO {fts_table}({fts_table}) VALUES('delete-all');"
+            )
+        # FTS4 has no 'delete-all', and its 'rebuild' fails once a content
+        # column is renamed. A plain populate is enough in both versions: the
+        # external-content index is already stale after the content table was
+        # dropped and recreated, and repopulating an external-content FTS table
+        # does not create duplicate index entries.
+        self.db.execute(
+            textwrap.dedent(
+                """
+            INSERT INTO {fts_table} (rowid, {fts_columns})
+                SELECT rowid, {content_columns} FROM {table};
+        """
+            )
+            .strip()
+            .format(
+                fts_table=fts_table,
+                fts_columns=", ".join(fts_columns),
+                content_columns=", ".join(content_columns),
+                table=quote_identifier(self.name),
+            )
+        )
+
+    @staticmethod
+    def _rename_trigger_statement(sql: str, new_name: str) -> str:
+        match = re.match(
+            r'(\s*CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?)'
+            r'("[^"]*"|`[^`]*`|\[[^\]]*\]|[^\s(]+)',
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            raise TransformError(f"Could not parse trigger name from SQL: {sql!r}")
+        return (
+            sql[: match.start(2)]
+            + quote_identifier(new_name)
+            + sql[match.end(2) :]
+        )
+
     def transform(
         self,
         *,
@@ -2687,6 +2916,25 @@ class Table(Queryable):
         """
         if not self.exists():
             raise ValueError("Cannot transform a table that doesn't exist yet")
+        # Resolve column references against the existing schema the same way
+        # transform_sql() does, so trigger snapshots see the exact column
+        # names that the rebuilt table will use.
+        existing_columns = self.columns_dict
+        resolved_rename = {
+            resolve_casing(column, existing_columns): new_name
+            for column, new_name in (rename or {}).items()
+        }
+        resolved_drop = {
+            resolve_casing(column, existing_columns)
+            for column in (drop or set())
+        }
+        # Snapshot the trigger configuration before the rebuild drops the old
+        # table (a DROP TABLE removes every trigger attached to it). The
+        # triggers are recreated against the replacement table inside the same
+        # transaction below.
+        trigger_snapshot = self._trigger_rebuild_snapshot(
+            rename=resolved_rename, drop=resolved_drop
+        )
         sqls = self.transform_sql(
             types=types,
             rename=rename,
@@ -2754,6 +3002,13 @@ class Table(Queryable):
             with self.db.atomic():
                 for sql in sqls:
                     self.db.execute(sql)
+                # Recreate the triggers that DROP TABLE (or the rename used by
+                # keep_table=) removed from the rebuilt table.
+                self._rebuild_triggers(
+                    trigger_snapshot,
+                    keep_table=keep_table,
+                    rename=resolved_rename,
+                )
                 # Run the foreign_key_check before we commit
                 if pragma_foreign_keys_was_on:
                     foreign_key_violations = self.db.execute(
@@ -3689,12 +3944,68 @@ class Table(Queryable):
         self.db.add_foreign_keys([fk_object])
         return self
 
+    def _counts_trigger_names(self, trigger_name_suffix: str = "") -> tuple[str, str]:
+        return (
+            self.name + self.db._counts_table_name + "_insert" + trigger_name_suffix,
+            self.name + self.db._counts_table_name + "_delete" + trigger_name_suffix,
+        )
+
+    def counts_triggers_sql(self, trigger_name_suffix: str = "") -> str:
+        """
+        Return the SQL that creates the ``_counts_insert``/``_counts_delete``
+        triggers which keep this table's cached row count up to date.
+
+        The statements are identical to the ones created by
+        :meth:`enable_counts`. A non-empty ``trigger_name_suffix`` is appended
+        to each trigger name so the statements can be recreated without
+        colliding with triggers that still belong to a table kept alive by
+        ``transform(keep_table=...)``.
+
+        :param trigger_name_suffix: Optional suffix for the generated trigger names
+        """
+        insert_name, delete_name = self._counts_trigger_names(trigger_name_suffix)
+        return (
+            textwrap.dedent("""
+        CREATE TRIGGER IF NOT EXISTS {trigger_insert} AFTER INSERT ON {table}
+        BEGIN
+            INSERT OR REPLACE INTO {counts_table}
+            VALUES (
+                {table_quoted},
+                COALESCE(
+                    (SELECT count FROM {counts_table} WHERE "table" = {table_quoted}),
+                0
+                ) + 1
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS {trigger_delete} AFTER DELETE ON {table}
+        BEGIN
+            INSERT OR REPLACE INTO {counts_table}
+            VALUES (
+                {table_quoted},
+                COALESCE(
+                    (SELECT count FROM {counts_table} WHERE "table" = {table_quoted}),
+                0
+                ) - 1
+            );
+        END;
+        """)
+            .strip()
+            .format(
+                counts_table=quote_identifier(self.db._counts_table_name),
+                table=quote_identifier(self.name),
+                table_quoted=self.db.quote(self.name),
+                trigger_insert=quote_identifier(insert_name),
+                trigger_delete=quote_identifier(delete_name),
+            )
+        )
+
     def enable_counts(self) -> None:
         """
         Set up triggers to update a cache of the count of rows in this table.
 
         See :ref:`python_api_cached_table_counts` for details.
         """
+        insert_name, delete_name = self._counts_trigger_names()
         sql = (
             textwrap.dedent("""
         {create_counts_table}
@@ -3730,12 +4041,8 @@ class Table(Queryable):
                 counts_table=quote_identifier(self.db._counts_table_name),
                 table=quote_identifier(self.name),
                 table_quoted=self.db.quote(self.name),
-                trigger_insert=quote_identifier(
-                    self.name + self.db._counts_table_name + "_insert"
-                ),
-                trigger_delete=quote_identifier(
-                    self.name + self.db._counts_table_name + "_delete"
-                ),
+                trigger_insert=quote_identifier(insert_name),
+                trigger_delete=quote_identifier(delete_name),
             )
         )
         with self.db.atomic():
@@ -3810,38 +4117,99 @@ class Table(Queryable):
         self.populate_fts(columns)
 
         if create_triggers:
-            old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
-            new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
-            columns_quoted = ", ".join(quote_identifier(c) for c in columns)
-            table = quote_identifier(self.name)
-            table_fts = quote_identifier(self.name + "_fts")
-            triggers = (
-                textwrap.dedent("""
-                CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-                CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                END;
-                CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-            """)
-                .strip()
-                .format(
-                    table=table,
-                    table_fts=table_fts,
-                    table_ai=quote_identifier(self.name + "_ai"),
-                    table_ad=quote_identifier(self.name + "_ad"),
-                    table_au=quote_identifier(self.name + "_au"),
-                    columns=columns_quoted,
-                    old_cols=old_cols,
-                    new_cols=new_cols,
-                )
-            )
-            self.db.executescript(triggers)
+            self.db.executescript(self.fts_triggers_sql(columns))
         return self
+
+    def fts_triggers_sql(
+        self,
+        columns: Iterable[str],
+        trigger_name_suffix: str = "",
+        content_columns: Iterable[str] | None = None,
+    ) -> str:
+        """
+        Return the SQL that creates the ``_ai``/``_ad``/``_au`` triggers which
+        keep this table's full-text search index up to date.
+
+        The statements are identical to the ones created by
+        :meth:`enable_fts` when called with ``create_triggers=True``. A
+        non-empty ``trigger_name_suffix`` is appended to each trigger name so
+        the statements can be recreated without colliding with triggers that
+        still belong to a table kept alive by ``transform(keep_table=...)``.
+
+        :param columns: Column names declared on the full-text search table
+        :param trigger_name_suffix: Optional suffix for the generated trigger names
+        :param content_columns: Columns on the content table to read from -
+          defaults to ``columns``, and only differs when a content column was
+          renamed by ``transform()`` while the full-text search table kept its
+          original column names
+        """
+        columns = list(columns)
+        content_columns = list(content_columns) if content_columns else columns
+        old_cols = ", ".join(
+            f"old.{quote_identifier(c)}" for c in content_columns
+        )
+        new_cols = ", ".join(
+            f"new.{quote_identifier(c)}" for c in content_columns
+        )
+        columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+        table = quote_identifier(self.name)
+        table_fts = quote_identifier(self.name + "_fts")
+        return (
+            textwrap.dedent("""
+            CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
+              INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
+            END;
+            CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
+              INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
+            END;
+            CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
+              INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
+              INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
+            END;
+        """)
+            .strip()
+            .format(
+                table=table,
+                table_fts=table_fts,
+                table_ai=quote_identifier(self.name + "_ai" + trigger_name_suffix),
+                table_ad=quote_identifier(self.name + "_ad" + trigger_name_suffix),
+                table_au=quote_identifier(self.name + "_au" + trigger_name_suffix),
+                columns=columns_quoted,
+                old_cols=old_cols,
+                new_cols=new_cols,
+            )
+        )
+
+    def fts_configuration(self) -> dict[str, Any] | None:
+        """
+        Return the full-text search configuration of this table, or ``None`` if
+        no full-text search virtual table is associated with it.
+
+        The returned dictionary contains the FTS virtual table name, the FTS
+        version it was created with and the columns that are indexed.
+        """
+        fts_table = self.detect_fts()
+        if fts_table is None:
+            return None
+        schema = self.db[fts_table].schema
+        match = _virtual_table_using_re.match(schema)
+        if match is None:
+            return None
+        fts_version = match.group("using").upper()
+        # The column list is everything between the opening parenthesis and
+        # the trailing content= (and optional tokenize=) options.
+        body = schema[match.end() :]
+        opening_paren = body.find("(")
+        closing_paren = body.rfind(")")
+        if opening_paren == -1 or closing_paren == -1:
+            return None
+        columns_part = body[opening_paren + 1 : closing_paren]
+        columns = parse_fts_columns(columns_part)
+        return {
+            "fts_table": fts_table,
+            "fts_version": fts_version,
+            "columns": columns,
+        }
 
     def populate_fts(self, columns: Iterable[str]) -> "Table":
         """

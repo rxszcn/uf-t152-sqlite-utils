@@ -876,6 +876,20 @@ def _quote_replacement(original: str, replacement: str) -> str:
     return '"{}"'.format(replacement.replace('"', '""'))
 
 
+def _apply_edits(sql: str, edits: list[tuple[int, int, str]]) -> str:
+    """Apply non-overlapping ``(start, end, replacement)`` edits to ``sql``.
+
+    Edits use spans from the original string, so they are applied left to
+    right with a running offset - applying them in reverse would misplace
+    every span to the left of a replacement that changed the length.
+    """
+    offset = 0
+    for start, end, replacement in sorted(edits):
+        sql = sql[: start + offset] + replacement + sql[end + offset :]
+        offset += len(replacement) - (end - start)
+    return sql
+
+
 def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
     """Rewrite column identifiers in a CHECK expression, preserving trivia."""
     if not rename:
@@ -892,6 +906,85 @@ def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
             edits.append(
                 (token.start, token.end, _quote_replacement(token.text, replacement))
             )
-    for start, end, replacement in reversed(edits):
-        expression = expression[:start] + replacement + expression[end:]
-    return expression
+    return _apply_edits(expression, edits)
+
+
+def parse_fts_columns(columns_sql: str) -> list[str]:
+    """Return the indexed columns declared inside an FTS virtual table body.
+
+    The body mixes comma-separated column declarations with ``key=value``
+    options such as ``content="t"`` or ``tokenize='porter unicode61'`` - only
+    the former are returned.
+    """
+    columns = []
+    for item, _, _ in _split_spans(columns_sql, _lex(columns_sql)):
+        tokens = _meaningful(_lex(item))
+        if not tokens:
+            continue
+        # A "key = value" option declaration is never a column.
+        if any(token.text == "=" for token in tokens):
+            continue
+        # A plain column declaration is a single identifier.
+        if len(tokens) == 1 and tokens[0].kind in ("identifier", "word"):
+            columns.append(_unquote(tokens[0].text))
+    return columns
+
+
+def rewrite_trigger_columns(sql: str, rename: dict[str, str]) -> str:
+    """Rewrite references to the trigger table's own columns in a trigger.
+
+    Inside a trigger body the only references to the trigger table's columns
+    are the ``new."col"`` / ``old."col"`` qualified names and the column list
+    of an ``UPDATE OF col, ...`` clause. A bare or differently-qualified
+    identifier belongs to another table (for example inside a subquery) and
+    must be left alone even when it spells the same as a renamed column.
+    """
+    if not rename:
+        return sql
+    folded = {_ascii_fold(key): value for key, value in rename.items()}
+    tokens = _lex(sql)
+    meaningful = _meaningful(tokens)
+    edits: list[tuple[int, int, str]] = []
+
+    def _record_if_renamed(token: _Token) -> None:
+        replacement = folded.get(_ascii_fold(_unquote(token.text)))
+        if replacement is not None:
+            edits.append(
+                (
+                    token.start,
+                    token.end,
+                    _quote_replacement(token.text, replacement),
+                )
+            )
+
+    for index, token in enumerate(meaningful):
+        if token.kind != "word" or token.text.upper() not in ("NEW", "OLD"):
+            continue
+        # The next meaningful tokens must be a "." followed by the column.
+        # Only that column token belongs to the trigger table; the NEW/OLD
+        # keyword itself is never rewritten.
+        if index + 2 >= len(meaningful):
+            continue
+        dot, column = meaningful[index + 1], meaningful[index + 2]
+        if dot.text == "." and column.kind in ("identifier", "word"):
+            _record_if_renamed(column)
+
+    # Columns named in an UPDATE OF clause refer to the trigger table. The
+    # clause spans the tokens between OF and ON, so it is handled as a
+    # separate, bounded scan rather than reusing the main enumeration.
+    for index, token in enumerate(meaningful):
+        if not (
+            token.kind == "word"
+            and token.text.upper() == "OF"
+            and index >= 1
+            and meaningful[index - 1].text.upper() == "UPDATE"
+        ):
+            continue
+        cursor = index + 1
+        while cursor < len(meaningful) and meaningful[cursor].text.upper() != "ON":
+            column = meaningful[cursor]
+            if column.kind in ("identifier", "word") and column.text != ",":
+                _record_if_renamed(column)
+            cursor += 1
+
+    return _apply_edits(sql, edits)

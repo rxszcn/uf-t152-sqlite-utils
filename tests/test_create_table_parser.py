@@ -241,3 +241,93 @@ def test_check_like_text_inside_strings_is_opaque(value):
     assert len(checks) == 1
     assert checks[0].column == "value"
     assert checks[0].check == f"value != '{value}'"
+
+
+def test_parse_fts_columns_ignores_options():
+    from sqlite_utils.create_table_parser import parse_fts_columns
+
+    body = '''
+        "title", "body",
+        tokenize='porter unicode61',
+        content="articles"
+    '''
+    assert parse_fts_columns(body) == ["title", "body"]
+
+
+def test_parse_fts_columns_without_options():
+    from sqlite_utils.create_table_parser import parse_fts_columns
+
+    assert parse_fts_columns('"a",\n    "b"') == ["a", "b"]
+
+
+def test_parse_fts_columns_allows_columns_named_like_options():
+    from sqlite_utils.create_table_parser import parse_fts_columns
+
+    # A column literally named "content" is not a key=value option.
+    assert parse_fts_columns('"content", "tokenize"') == ["content", "tokenize"]
+
+
+def test_rewrite_trigger_columns_renames_new_and_old_references():
+    from sqlite_utils.create_table_parser import rewrite_trigger_columns
+
+    sql = (
+        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN\n"
+        '  INSERT INTO t_fts (rowid, "title") VALUES (new.rowid, new."title");\n'
+        "END"
+    )
+    rewritten = rewrite_trigger_columns(sql, {"title": "headline"})
+    assert 'new."headline"' in rewritten
+    assert "new.title" not in rewritten
+    # The FTS table's own column keeps its name - only new./old. references
+    # belong to the trigger table.
+    assert '(rowid, "title")' in rewritten
+
+
+def test_rewrite_trigger_columns_handles_update_of_and_case():
+    from sqlite_utils.create_table_parser import rewrite_trigger_columns
+
+    sql = (
+        "CREATE TRIGGER t_tr AFTER UPDATE OF a ON t\n"
+        "WHEN old.a <> new.A BEGIN SELECT new.a; END"
+    )
+    rewritten = rewrite_trigger_columns(sql, {"a": "alpha"})
+    assert "UPDATE OF alpha ON t" in rewritten
+    assert "old.alpha" in rewritten
+    assert "new.alpha" in rewritten
+    assert "new.A" not in rewritten
+
+
+def test_rewrite_trigger_columns_leaves_other_tables_alone():
+    from sqlite_utils.create_table_parser import rewrite_trigger_columns
+
+    # "other.a" is a different table's column and must not be renamed, even
+    # though the trigger table also has a column "a".
+    sql = (
+        "CREATE TRIGGER t_tr AFTER UPDATE OF a ON t BEGIN\n"
+        "  INSERT INTO other (a) VALUES (new.a);\n"
+        "END"
+    )
+    rewritten = rewrite_trigger_columns(sql, {"a": "alpha"})
+    assert "INSERT INTO other (a)" in rewritten
+    assert "VALUES (new.alpha)" in rewritten
+
+
+def test_rewrite_trigger_columns_leaves_literals_alone():
+    from sqlite_utils.create_table_parser import rewrite_trigger_columns
+
+    sql = (
+        "CREATE TRIGGER log_tr AFTER INSERT ON log BEGIN\n"
+        "  INSERT INTO audit (note) VALUES ('logged ' || new.msg);\n"
+        "END"
+    )
+    rewritten = rewrite_trigger_columns(sql, {"msg": "message"})
+    assert "'logged '" in rewritten
+    assert "new.message" in rewritten
+    assert "new.msg" not in rewritten
+
+
+def test_rewrite_trigger_columns_no_rename_is_identity():
+    from sqlite_utils.create_table_parser import rewrite_trigger_columns
+
+    sql = "CREATE TRIGGER t_tr AFTER INSERT ON t BEGIN SELECT new.a; END"
+    assert rewrite_trigger_columns(sql, {}) == sql
